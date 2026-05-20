@@ -18,12 +18,15 @@ mijiaAPI --help
 
 ## 步骤 2：安装插件文件
 
-将 `mijia-hook.js` 复制到 OpenCode 的全局插件目录（`~/.config/opencode/plugins/`）。
+将以下两个文件复制到 OpenCode 的全局插件目录（`~/.config/opencode/plugins/`）。
 
 ```
 ~/.config/opencode/plugins/
-└── mijia-hook.js
+├── mijia-hook.js
+└── mijia_api_helper.py
 ```
+
+`mijia-hook.js` 是插件入口，启动时 spawn `mijia_api_helper.py` 作为常驻子进程，通过 stdin/stdout JSON-line 协议通信，实现批量设备属性读写。
 
 ## 步骤 3：登录米家账号
 
@@ -53,7 +56,7 @@ mijiaAPI -l
 
 ## 步骤 5：设备规格缓存（首次必做）
 
-mijiaAPI 需要从 [米家规格平台](https://home.miot-spec.com/) 获取设备属性定义，结果会缓存到本地。如果自动获取失败（网站格式变更），需手动生成缓存。
+mijiaAPI 需要从 [米家规格平台](https://home.miot-spec.com/) 获取设备属性定义，结果缓存到 `~/.config/mijia-api/<model>.json`。
 
 ### 自动获取
 
@@ -65,53 +68,67 @@ mijiaAPI --get_device_info <model>
 
 ### 手动生成（自动获取失败时）
 
-如遇到以下错误：
+如遇到 `JSONDecodeError`，说明网站 HTML 格式已变更。使用以下 Python 脚本生成缓存（将 `<model>` 替换为实际值）：
 
+```python
+import json, requests, os, re
+
+model = "<model>"  # 例如: yeelink.light.bslamp2
+cache_dir = os.path.expanduser("~/.config/mijia-api")
+os.makedirs(cache_dir, exist_ok=True)
+
+resp = requests.get(f"https://home.miot-spec.com/spec/{model}",
+    headers={"User-Agent": "mijiaAPI/3.0"})
+match = re.search(r'<script data-page="app" type="application/json">(.*?)</script>', resp.text)
+if not match:
+    raise Exception("未找到规格数据")
+
+data = json.loads(match.group(1).replace("&quot;", '"'))
+product = data["props"]["product"]
+tree = data["props"]["tree"]
+
+result = {"name": product["name"], "model": model, "properties": [], "actions": []}
+prop_names = set()
+
+for svc in tree["services"]:
+    siid = svc["iid"]
+    for prop in svc.get("properties", []):
+        fmt = prop["format"]
+        if fmt.startswith("int"):
+            ft = "int"
+        elif fmt.startswith("uint"):
+            ft = "uint"
+        else:
+            ft = fmt
+        rw = ("r" if "read" in prop.get("access", []) else "") + \
+             ("w" if "write" in prop.get("access", []) else "")
+        pname = prop["type"]
+        if pname in prop_names:
+            pname = svc["type"] + "-" + pname
+        prop_names.add(pname)
+        vl = prop.get("valueList")
+        result["properties"].append({
+            "name": pname,
+            "description": prop.get("description", ""),
+            "type": ft,
+            "rw": rw,
+            "unit": prop.get("unit"),
+            "range": prop.get("valueRange"),
+            "value-list": vl if vl else None,
+            "method": {"siid": siid, "piid": prop["iid"]}
+        })
+    for act in svc.get("actions", []):
+        result["actions"].append({
+            "name": act["type"],
+            "description": act.get("description", ""),
+            "method": {"siid": siid, "aiid": act["iid"]}
+        })
+
+with open(os.path.join(cache_dir, f"{model}.json"), "w", encoding="utf-8") as f:
+    json.dump(result, f, indent=2, ensure_ascii=False)
+
+print(f"缓存已生成: {len(result['properties'])} 属性, {len(result['actions'])} 动作")
 ```
-json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
-File ".../mijiaAPI/devices.py", line 295, in get_device_info
-```
-
-说明网站 HTML 格式已变更（2026-05-18），mijiaAPI 库无法自动解析。此时需手动提取并生成缓存：
-
-1. 获取设备 model（从步骤 4 的设备列表中获取，如 `yeelink.light.bslamp2`）
-2. 拼接规格页面地址：`https://home.miot-spec.com/spec/<model>`
-3. 获取页面内容，找到 `<script data-page="app" type="application/json">` 标签
-4. 提取该标签内的 JSON 内容（从 `>` 到 `</script>` 之间），将 `&quot;` 替换为 `"`
-5. 将 JSON 解析后转换为缓存格式，具体格式为：
-
-```json
-{
-  "name": "<设备名称>",
-  "model": "<model>",
-  "properties": [
-    {
-      "name": "on",
-      "description": "...",
-      "type": "bool",
-      "rw": "rw",
-      "unit": null,
-      "range": null,
-      "value-list": null,
-      "method": { "siid": 2, "piid": 1 }
-    }
-  ],
-  "actions": [
-    {
-      "name": "toggle",
-      "description": "...",
-      "method": { "siid": 2, "aiid": 1 }
-    }
-  ]
-}
-```
-
-数据来源于 JSON 中的 `props.tree.services` 数组：
-- 每个 service 对象的 `iid` → `siid`
-- `properties[].iid` → `piid`，`type` → `name`，`format` 归一化为 `bool`/`int`/`uint`/`float`/`string`，`access` → `rw`
-- `actions[].iid` → `aiid`，`type` → `name`
-
-6. 保存为 `{auth_data_path.parent}/{model}.json`（默认 `~/.config/mijia-api/<model>.json`）
 
 ## 步骤 6：确认操作需求
 
@@ -145,7 +162,7 @@ async function on_question() {
 // AI 空闲 (session.status {idle})
 async function on_idle() {
   const DEVICE_ID = "<填入设备 did>"
-  const color = makeColorUint(1.0, 0.0, 0.0)        // 红色
+  const color = makeColorUint(0.0, 1.0, 0.0)        // 绿色
   await applyState(DEVICE_ID, ["color", color], ["brightness", 50], ["on", true])
 }
 
@@ -160,7 +177,13 @@ async function on_exit() {
 
 ## 步骤 7：测试（可选）
 
-询问用户是否需要测试。如确认，用 `mijiaAPI set` 验证设备可用：
+询问用户是否需要测试。如确认，可直接用 Python helper 验证：
+
+```bash
+python mijia_api_helper.py <<< '{"id":1,"method":"set","did":"<did>","props":[["on","True"]]}'
+```
+
+或使用 CLI：
 
 ```bash
 mijiaAPI set --did <id> --prop_name on --value True

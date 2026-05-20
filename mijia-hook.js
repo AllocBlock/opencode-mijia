@@ -1,6 +1,7 @@
-// === 工具函数（无需修改） ===
+// === 工具函数 ===
 
-const { exec } = require('child_process')
+const { spawn } = require('child_process')
+const path = require('path')
 
 function makeColorUint(r, g, b) {
   const ri = Math.round(r * 255)
@@ -9,14 +10,52 @@ function makeColorUint(r, g, b) {
   return (ri << 16) | (gi << 8) | bi
 }
 
-function runMijiaCli(args) {
+let _proc = null
+let _reqId = 0
+let _pending = {}
+let _buf = ''
+
+function getProc() {
+  if (_proc) return _proc
+  const script = path.join(__dirname, 'mijia_api_helper.py')
+  _proc = spawn('python', [script], {
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  })
+  _proc.stderr.on('data', (data) => {
+    const lines = data.toString().split('\n').filter(l => l.trim())
+    for (const l of lines) {
+      try { console.error('[mijia]', JSON.parse(l).error) } catch (_) {}
+    }
+  })
+  _proc.stdout.on('data', (data) => {
+    _buf += data.toString()
+    while (true) {
+      const idx = _buf.indexOf('\n')
+      if (idx === -1) break
+      const line = _buf.slice(0, idx)
+      _buf = _buf.slice(idx + 1)
+      try {
+        const resp = JSON.parse(line)
+        if (resp.id != null && _pending[resp.id]) {
+          const p = _pending[resp.id]
+          delete _pending[resp.id]
+          if (resp.error) p.reject(new Error(resp.error))
+          else p.resolve()
+        }
+      } catch (_) {}
+    }
+  })
+  _proc.on('exit', () => { _proc = null })
+  return _proc
+}
+
+function send(req) {
   return new Promise((resolve, reject) => {
-    exec(`mijiaAPI ${args}`, {
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
-    }, (error, stdout, stderr) => {
-      if (error) reject(error)
-      else resolve()
-    })
+    const id = ++_reqId
+    req.id = id
+    _pending[id] = { resolve, reject }
+    getProc().stdin.write(JSON.stringify(req) + '\n')
   })
 }
 
@@ -26,12 +65,15 @@ async function applyState(deviceId, ...pairs) {
   if (!deviceId) return
   if (!_cs[deviceId]) _cs[deviceId] = {}
   const cs = _cs[deviceId]
+  const props = []
   for (const [k, v] of pairs) {
     const val = typeof v === 'boolean' ? (v ? 'True' : 'False') : String(v)
     if (cs[k] === val) continue
-    await runMijiaCli(`set --did ${deviceId} --prop_name ${k} --value ${val}`)
+    props.push([k, v])
     cs[k] = val
   }
+  if (props.length === 0) return
+  await send({ method: 'set', did: deviceId, props })
 }
 
 // === 生命周期（安装时由 agent 实现） ===
@@ -61,9 +103,9 @@ async function on_question() {
 
 // AI 空闲 (session.status {idle})
 async function on_idle() {
-  // 示例：红色灯光
+  // 示例：绿色灯光
   // const DEVICE_ID = ""
-  // const color = makeColorUint(1.0, 0.0, 0.0)
+  // const color = makeColorUint(0.0, 1.0, 0.0)
   // await applyState(DEVICE_ID, ["color", color], ["brightness", 50], ["on", true])
 }
 

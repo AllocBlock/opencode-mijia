@@ -118,14 +118,32 @@ async function on_exit() {
 
 // === 插件入口（无需修改） ===
 
+const SUB_SESSIONS = new Set()
+
 export const MijiaHookPlugin = async () => {
   await on_start()
   process.on('beforeExit', async () => { await on_exit() })
 
   return {
     event: async ({ event }) => {
+      const props = event.properties
+
+      if (event.type === "session.created") {
+        if (props?.info?.parentID) {
+          SUB_SESSIONS.add(props.sessionID)
+        }
+        return
+      }
+
+      if (event.type === "session.deleted") {
+        SUB_SESSIONS.delete(props?.sessionID)
+        return
+      }
+
+      if (SUB_SESSIONS.has(props?.sessionID)) return
+
       if (event.type === "session.status") {
-        const t = event.properties?.status?.type
+        const t = props?.status?.type
         if (t === "busy") await on_busy()
         if (t === "idle") await on_idle()
       }
